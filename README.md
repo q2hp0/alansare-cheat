@@ -1,17 +1,35 @@
-# ALANSARE CS2 Cheat
+alansare cs2 cheat
 
-## Prerequisites
-* Rust (latest stable version)
-* Linux
+linux cs2 project written in rust.
 
-## Build and Run
+requirements
+linux
+rust
+cargo
+install rust
 
-1. Build the project in release mode:
-   ```bash
-   cargo build --release
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+```
 
-    Run the application with root privileges:
-    
+build
 
-    sudo ./target/release/alansare-cs2-cheat
+```bash
+git clone https://github.com/q2hp0/alansare-cheat.git
+cd alansare-cheat
+cargo build --release
+```
 
+run
+
+```bash
+sudo ./target/release/alansare-cs2-cheat
+```
+
+update
+
+```bash
+cd alansare-cheat
+git pull
+cargo build --release
