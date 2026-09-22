@@ -1,0 +1,610 @@
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
+
+use egui::{Color32, Painter, Pos2, Stroke, pos2};
+use shared::{Bones, Data, PlayerData, SoundType};
+
+use crate::{
+    config::player::{BoxMode, DrawMode, SnaplineAnchor, SnaplineMode, VisibilityMode},
+    config::text::TextPosition,
+    math::{CYLINDER_SAMPLES, world_to_screen, world_to_screen_normalized},
+    ui::{app::AppState, color::Colors},
+};
+
+impl AppState {
+    pub fn draw_player(&self, painter: &Painter, player: &PlayerData, data: &Data) {
+        match self.config.player.visibility {
+            VisibilityMode::InvisibleOnly if player.visible => {
+                return;
+            }
+            VisibilityMode::VisibleOnly if !player.visible => {
+                return;
+            }
+            _ => {}
+        }
+
+        let sound = self.player_sounds.get(&player.steam_id);
+        let sound_alpha = if self.config.player.sound.enabled {
+            self.player_sound_alpha(player, sound, data)
+        } else {
+            None
+        };
+
+        self.player_box(painter, player, data, sound_alpha);
+        self.player_tracers(painter, player, data, sound_alpha);
+        self.skeleton(painter, player, data, sound_alpha);
+    }
+
+    pub fn player_sound_alpha(
+        &self,
+        player: &PlayerData,
+        sound: Option<&(Instant, SoundType)>,
+        data: &Data,
+    ) -> Option<f32> {
+        if self.config.player.sound.show_visible && player.visible {
+            return Some(1.0);
+        }
+
+        let Some((time, sound)) = sound else {
+            return Some(0.0);
+        };
+
+        let local_player = &data.local_player;
+        let max_distance = match sound {
+            SoundType::Footstep => self.config.player.sound.footstep_diameter,
+            SoundType::Gunshot => self.config.player.sound.gunshot_diameter,
+            SoundType::Weapon => self.config.player.sound.weapon_diameter,
+        };
+        if local_player.position.distance(player.position) > max_distance {
+            return Some(0.0);
+        }
+
+        if time.elapsed() > self.total_sound_duration() {
+            return Some(0.0);
+        }
+
+        Some(
+            1.0 - ((time.elapsed().as_secs_f32() - self.config.player.sound.fadeout_start)
+                / self.config.player.sound.fadeout_duration),
+        )
+    }
+
+    fn total_sound_duration(&self) -> Duration {
+        Duration::from_secs_f32(
+            self.config.player.sound.fadeout_start + self.config.player.sound.fadeout_duration,
+        )
+    }
+
+    fn alpha(color: Color32, alpha: f32) -> Color32 {
+        Color32::from_rgba_unmultiplied(
+            color.r(),
+            color.g(),
+            color.b(),
+            (alpha.clamp(0.0, 1.0) * 255.0) as u8,
+        )
+    }
+
+    pub(super) fn player_color(color: i32) -> Color32 {
+        match color {
+            0 => Colors::BLUE,
+            1 => Colors::GREEN,
+            2 => Colors::YELLOW,
+            3 => Colors::ORANGE,
+            4 => Colors::PURPLE,
+            _ => Colors::SUBTEXT,
+        }
+    }
+
+    fn player_box(&self, painter: &Painter, player: &PlayerData, data: &Data, alpha: Option<f32>) {
+        let alpha = match alpha {
+            Some(alpha) => alpha.clamp(0.0, 1.0),
+            None => 1.0,
+        };
+        let distance = data
+            .local_player
+            .position
+            .distance(player.position)
+            .max(1.0);
+
+        let esp_scale = (500.0 / distance).clamp(0.4, 1.0);
+        let line_width = self.config.hud.line_width * esp_scale;
+
+        let health_color = self.health_color(
+            player.health,
+            player.max_health,
+            self.config.player.box_visible_color.a(),
+        );
+        let mut color = match &self.config.player.draw_box {
+            DrawMode::None => health_color,
+            DrawMode::Health => health_color,
+            DrawMode::Color => {
+                if player.visible {
+                    self.config.player.box_visible_color
+                } else {
+                    self.config.player.box_invisible_color
+                }
+            }
+            DrawMode::PlayerColor => Self::player_color(player.color),
+        };
+
+        color = Self::alpha(color, alpha);
+
+        let stroke = Stroke::new(line_width, color);
+
+        let Some((tl, tr, bl, br)) = self.projected_world_bounds(player, data) else {
+            return;
+        };
+
+        if self.config.player.draw_box != DrawMode::None {
+            if self.config.player.box_mode == BoxMode::Gap {
+                self.draw_projected_gap_box(painter, tl, tr, bl, br, stroke);
+            } else {
+                painter.rect(
+                    egui::Rect::from_min_max(tl, br),
+                    0,
+                    Color32::TRANSPARENT,
+                    stroke,
+                    egui::StrokeKind::Middle,
+                );
+            }
+        }
+
+        let edge = tl - bl;
+        let edge_length = edge.length();
+        if edge_length > f32::EPSILON {
+            let direction = edge / edge_length;
+            let outward = egui::vec2(direction.y, -direction.x);
+            let mut offset = outward * line_width * 2.0;
+            let draw_bar = |offset: egui::Vec2, fraction: f32, color: Color32| {
+                let start = bl + offset;
+                painter.line_segment(
+                    [start, start + edge * fraction.clamp(0.0, 1.0)],
+                    Stroke::new(line_width, Self::alpha(color, alpha)),
+                );
+            };
+            if self.config.player.health_bar {
+                draw_bar(
+                    offset,
+                    player.health.max(0) as f32 / player.max_health.max(1) as f32,
+                    health_color,
+                );
+                offset += outward * line_width * 2.0;
+            }
+            if self.config.player.armor_bar && player.armor > 0 {
+                draw_bar(offset, player.armor as f32 / 100.0, Color32::BLUE);
+            }
+        }
+
+        let pad = 4.0 * esp_scale;
+        let mut offset = 0.0;
+
+        if self.config.player.player_name {
+            let cat = &self.config.hud.overlay_text.player_name;
+            let fs = cat.font_size * esp_scale;
+            let color = if cat.use_player_color {
+                Self::player_color(player.color)
+            } else {
+                cat.color
+            };
+            let anchor = self.box_anchor(tl, tr, bl, br, cat.position, pad, offset);
+            self.text_sized(
+                painter,
+                &player.name,
+                anchor,
+                cat.align.to_align2(),
+                Self::alpha(color, alpha),
+                fs,
+            );
+            offset += fs;
+        }
+
+        if self.config.player.tags {
+            let cat = &self.config.hud.overlay_text.player_tags;
+            let fs = cat.font_size * esp_scale;
+            let color = if cat.use_player_color {
+                Self::player_color(player.color)
+            } else {
+                cat.color
+            };
+            let anchor = self.box_anchor(tl, tr, bl, br, cat.position, pad, offset);
+            if player.has_defuser {
+                self.text_sized(
+                    painter,
+                    "\u{e00f}",
+                    anchor,
+                    cat.align.to_align2(),
+                    Self::alpha(color, alpha),
+                    fs,
+                );
+                offset += fs;
+            }
+            if player.has_helmet {
+                let anchor = self.box_anchor(tl, tr, bl, br, cat.position, pad, offset);
+                self.text_sized(
+                    painter,
+                    "\u{e017}",
+                    anchor,
+                    cat.align.to_align2(),
+                    Self::alpha(color, alpha),
+                    fs,
+                );
+                offset += fs;
+            }
+            if player.has_bomb {
+                let anchor = self.box_anchor(tl, tr, bl, br, cat.position, pad, offset);
+                self.text_sized(
+                    painter,
+                    "\u{e01e}",
+                    anchor,
+                    cat.align.to_align2(),
+                    Self::alpha(color, alpha),
+                    fs,
+                );
+            }
+        }
+
+        if self.config.player.weapon_icon {
+            let icon_cat = &self.config.hud.overlay_text.weapon_icon;
+            let ammo_cat = &self.config.hud.overlay_text.ammo_text;
+            let ifs = icon_cat.font_size * esp_scale;
+            let afs = ammo_cat.font_size * esp_scale;
+            let icon_color = if icon_cat.use_player_color {
+                Self::player_color(player.color)
+            } else {
+                icon_cat.color
+            };
+            let ammo_color = if ammo_cat.use_player_color {
+                Self::player_color(player.color)
+            } else {
+                ammo_cat.color
+            };
+            let icon_anchor = self.box_anchor(tl, tr, bl, br, icon_cat.position, 0.0, 0.0);
+            self.text_sized(
+                painter,
+                player.weapon.to_icon().to_string(),
+                icon_anchor,
+                icon_cat.align.to_align2(),
+                Self::alpha(icon_color, alpha),
+                ifs,
+            );
+            if player.ammo.0 >= 0 {
+                let ammo_anchor = self.box_anchor(tl, tr, bl, br, ammo_cat.position, 0.0, afs);
+                self.text_sized(
+                    painter,
+                    format!("{}/{}", player.ammo.0, player.ammo.1),
+                    ammo_anchor,
+                    ammo_cat.align.to_align2(),
+                    Self::alpha(ammo_color, alpha),
+                    afs,
+                );
+            }
+        }
+    }
+
+    fn player_tracers(
+        &self,
+        painter: &Painter,
+        player: &PlayerData,
+        data: &Data,
+        alpha: Option<f32>,
+    ) {
+        let mode = &self.config.player.snaplines;
+
+        let alpha_col = alpha.unwrap_or(255.0) as u8;
+
+        let color: Color32 = match mode {
+            SnaplineMode::None => return,
+            SnaplineMode::Color => self.config.player.snapline_color,
+            SnaplineMode::PlayerColor => Self::player_color(player.color),
+            SnaplineMode::Distance => {
+                const MAX_DIST: f32 = 3000.0;
+                let dist: u8 = (data
+                    .local_player
+                    .position
+                    .distance(player.position)
+                    .min(MAX_DIST)
+                    / MAX_DIST
+                    * 255.0) as u8;
+                Color32::from_rgba_unmultiplied(255 - dist, dist, 0, alpha_col)
+            }
+            SnaplineMode::Health => {
+                let h: u8 = ((player.health as f32 / player.max_health as f32) * 255.0) as u8;
+                Color32::from_rgba_unmultiplied(255 - h, h, 0, alpha_col)
+            }
+        };
+
+        let stroke = Stroke::new(self.config.hud.line_width, color);
+
+        let target_pos = player.position;
+
+        let y_value = match self.config.player.snapline_anchor {
+            SnaplineAnchor::Center => 50.0,
+            SnaplineAnchor::Bottom => 100.0,
+        };
+
+        let center = Pos2::new(
+            data.window_size.x / 2.0,
+            data.window_size.y / 100.0 * y_value,
+        );
+        let target = world_to_screen_normalized(&target_pos, data);
+
+        let points = vec![center, target];
+
+        painter.line(points, stroke);
+    }
+
+    pub fn calculate_box_corners<K>(
+        screen_bones: &HashMap<K, Pos2>,
+    ) -> Option<(Pos2, Pos2, Pos2, Pos2)> {
+        let screen_positions: Vec<&Pos2> = screen_bones.values().collect();
+
+        if screen_positions.len() < 2 {
+            return None;
+        }
+
+        let min_x = screen_positions
+            .iter()
+            .map(|p| p.x)
+            .reduce(f32::min)
+            .unwrap();
+        let max_x = screen_positions
+            .iter()
+            .map(|p| p.x)
+            .reduce(f32::max)
+            .unwrap();
+        let min_y = screen_positions
+            .iter()
+            .map(|p| p.y)
+            .reduce(f32::min)
+            .unwrap();
+        let max_y = screen_positions
+            .iter()
+            .map(|p| p.y)
+            .reduce(f32::max)
+            .unwrap();
+
+        let margin_x = (max_x - min_x) * 0.1;
+        let margin_y = (max_y - min_y) * 0.1;
+
+        Some((
+            pos2(min_x - margin_x, min_y - margin_y),
+            pos2(max_x + margin_x, min_y - margin_y),
+            pos2(min_x - margin_x, max_y + margin_y),
+            pos2(max_x + margin_x, max_y + margin_y),
+        ))
+    }
+
+    fn draw_projected_gap_box(
+        &self,
+        painter: &Painter,
+        tl: Pos2,
+        tr: Pos2,
+        bl: Pos2,
+        br: Pos2,
+        stroke: Stroke,
+    ) {
+        let width = (tr - tl).length();
+        let height = (bl - tl).length();
+        let corner_x = width * 0.25;
+        let corner_y = height * 0.25;
+        painter.line(vec![pos2(tl.x, tl.y + corner_y), tl, pos2(tl.x + corner_x, tl.y)], stroke);
+        painter.line(vec![pos2(tr.x - corner_x, tr.y), tr, pos2(tr.x, tr.y + corner_y)], stroke);
+        painter.line(vec![pos2(bl.x, bl.y - corner_y), bl, pos2(bl.x + corner_x, bl.y)], stroke);
+        painter.line(vec![pos2(br.x - corner_x, br.y), br, pos2(br.x, br.y - corner_y)], stroke);
+    }
+
+    pub fn draw_gap_box(
+        &self,
+        painter: &Painter,
+        tl: Pos2,
+        tr: Pos2,
+        bl: Pos2,
+        br: Pos2,
+        stroke: Stroke,
+    ) {
+        let gap_size = (tr.x - tl.x) / 8.0; // eighth of width
+        let corner_length = (tr.x - tl.x) / 4.0 - 2.0; // quarter width minus small offset
+
+        painter.line(
+            vec![
+                pos2(tl.x + gap_size, tl.y),
+                tl,
+                pos2(tl.x, tl.y + corner_length),
+            ],
+            stroke,
+        );
+
+        painter.line(
+            vec![
+                pos2(tr.x - gap_size, tr.y),
+                tr,
+                pos2(tr.x, tr.y + corner_length),
+            ],
+            stroke,
+        );
+
+        painter.line(
+            vec![
+                pos2(bl.x + gap_size, bl.y),
+                bl,
+                pos2(bl.x, bl.y - corner_length),
+            ],
+            stroke,
+        );
+
+        painter.line(
+            vec![
+                pos2(br.x - gap_size, br.y),
+                br,
+                pos2(br.x, br.y - corner_length),
+            ],
+            stroke,
+        );
+    }
+
+    fn skeleton(&self, painter: &Painter, player: &PlayerData, data: &Data, alpha: Option<f32>) {
+        let distance = data
+            .local_player
+            .position
+            .distance(player.position)
+            .max(1.0);
+        let esp_scale = (500.0 / distance).clamp(0.25, 1.0);
+
+        let mut color = match &self.config.player.draw_skeleton {
+            DrawMode::None => return,
+            DrawMode::Health => self.health_color(
+                player.health,
+                player.max_health,
+                self.config.player.skeleton_color.a(),
+            ),
+            DrawMode::Color => self.config.player.skeleton_color,
+            DrawMode::PlayerColor => Self::player_color(player.color),
+        };
+        if let Some(alpha) = alpha {
+            color = Self::alpha(color, alpha);
+        }
+        let stroke = Stroke::new(self.config.hud.line_width * esp_scale, color);
+
+        for (a, b) in &Bones::CONNECTIONS {
+            let Some(a) = player.bones.get(a) else {
+                continue;
+            };
+            let Some(b) = player.bones.get(b) else {
+                continue;
+            };
+
+            let Some(a) = world_to_screen(a, data) else {
+                continue;
+            };
+            let Some(b) = world_to_screen(b, data) else {
+                continue;
+            };
+
+            painter.line(vec![a, b], stroke);
+        }
+
+        // head circle
+        if !self.config.player.head_circle {
+            return;
+        }
+        let Some(neck) = player.bones.get(&Bones::Neck) else {
+            return;
+        };
+        let Some(spine) = player.bones.get(&Bones::Spine3) else {
+            return;
+        };
+        let Some(head) = player.bones.get(&Bones::Head) else {
+            return;
+        };
+
+        let Some(neck) = world_to_screen(neck, data) else {
+            return;
+        };
+        let Some(spine) = world_to_screen(spine, data) else {
+            return;
+        };
+        let Some(head) = world_to_screen(head, data) else {
+            return;
+        };
+
+        let radius = (spine.y - neck.y).abs() / 2.4;
+        painter.circle_stroke(head, radius, stroke);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn box_anchor(
+        &self,
+        tl: Pos2,
+        tr: Pos2,
+        bl: Pos2,
+        br: Pos2,
+        position: TextPosition,
+        pad: f32,
+        offset: f32,
+    ) -> Pos2 {
+        let top = pos2((tl.x + tr.x) / 2.0, tl.y);
+        let bottom = pos2((bl.x + br.x) / 2.0, bl.y);
+        let center = pos2((tl.x + br.x) / 2.0, (tl.y + bl.y) / 2.0);
+        let center_left = pos2(tl.x, (tl.y + bl.y) / 2.0);
+        let center_right = pos2(tr.x, (tr.y + br.y) / 2.0);
+        match position {
+            TextPosition::TopLeft => pos2(tl.x + pad, tl.y + offset),
+            TextPosition::TopCenter => pos2(top.x, tl.y + offset),
+            TextPosition::TopRight => pos2(tr.x + pad, tr.y + offset),
+            TextPosition::CenterLeft => pos2(center_left.x + pad, center_left.y + offset),
+            TextPosition::Center => pos2(center.x, center.y + offset),
+            TextPosition::CenterRight => pos2(center_right.x + pad, center_right.y + offset),
+            TextPosition::BottomLeft => pos2(bl.x + pad, bl.y + offset),
+            TextPosition::BottomCenter => pos2(bottom.x, bl.y + offset),
+            TextPosition::BottomRight => pos2(br.x + pad, bl.y + offset),
+        }
+    }
+
+    fn projected_world_bounds(
+        &self,
+        player: &PlayerData,
+        data: &Data,
+    ) -> Option<(Pos2, Pos2, Pos2, Pos2)> {
+        let min = player.collision_mins;
+        let max = player.collision_maxs;
+        if !min.is_finite() || !max.is_finite() || min.cmpgt(max).any() || min == max {
+            return None;
+        }
+        const SAMPLES: usize = CYLINDER_SAMPLES;
+        let center = (min + max) * 0.5;
+        let radius = 0.5 * (max.x - min.x).abs().max((max.y - min.y).abs());
+        let mut points = [Pos2::ZERO; CYLINDER_SAMPLES * 2];
+        for layer in 0..2 {
+            let z = if layer == 0 { min.z } else { max.z };
+            for i in 0..SAMPLES {
+                let angle = std::f32::consts::TAU * i as f32 / SAMPLES as f32;
+                let local = glam::Vec3::new(
+                    center.x + radius * angle.cos(),
+                    center.y + radius * angle.sin(),
+                    z,
+                );
+                points[layer * SAMPLES + i] =
+                    world_to_screen(&player.collision_transform.transform_point3(local), data)?;
+            }
+        }
+        let left = (0..SAMPLES).min_by(|a, b| {
+            points[*a]
+                .x
+                .min(points[*a + SAMPLES].x)
+                .partial_cmp(&points[*b].x.min(points[*b + SAMPLES].x))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+        let right = (0..SAMPLES).max_by(|a, b| {
+            points[*a]
+                .x
+                .max(points[*a + SAMPLES].x)
+                .partial_cmp(&points[*b].x.max(points[*b + SAMPLES].x))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+        Some((
+            points[left + SAMPLES],
+            points[right + SAMPLES],
+            points[left],
+            points[right],
+        ))
+    }
+
+    pub fn update_player_sounds(&mut self) {
+        let data = self.data.lock();
+
+        for player in &data.players {
+            let Some(sound) = &player.sound else {
+                continue;
+            };
+
+            self.player_sounds
+                .insert(player.steam_id, (Instant::now(), *sound));
+        }
+
+        let total_duration = self.total_sound_duration();
+        self.player_sounds
+            .retain(|_, (time, _)| time.elapsed() < total_duration);
+    }
+}
